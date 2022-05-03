@@ -2,6 +2,7 @@ package bolt
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sort"
 )
@@ -249,7 +250,7 @@ func (c *Cursor) next() (key []byte, value []byte, flags uint32) {
 	}
 }
 
-// search recursively performs a binary search against a given page/node until it finds a given key.
+// search recursively performs an interpolation search against a given page/node until it finds a given key.
 func (c *Cursor) search(key []byte, pgid pgid) {
 	p, n := c.bucket.pageNode(pgid)
 	if p != nil && (p.flags&(branchPageFlag|leafPageFlag)) == 0 {
@@ -272,19 +273,64 @@ func (c *Cursor) search(key []byte, pgid pgid) {
 }
 
 func (c *Cursor) searchNode(key []byte, n *node) {
+	var index int
 	var exact bool
-	index := sort.Search(len(n.inodes), func(i int) bool {
-		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
-		// sort.Search() finds the lowest index where f() != -1 but we need the highest index.
-		ret := bytes.Compare(n.inodes[i].key, key)
-		if ret == 0 {
+
+	// Interpolation search
+	var mid int
+	var low int
+	low = 0
+	var high int
+	high = len(n.inodes)
+
+	// byteCompare(a, b) -> 1: a > b, -1: a < b, 0: a == b
+	for (bytes.Compare(n.inodes[low].key, key) == -1) && (bytes.Compare(n.inodes[high].key, key) == 1) {
+		key_int := int(binary.BigEndian.Uint64(key))
+		low_int := int(binary.BigEndian.Uint64(n.inodes[low].key))
+		high_int := int(binary.BigEndian.Uint64(n.inodes[high].key))
+		mid = low + ((key_int-low_int)*(high-low))/(high_int-low_int)
+
+		if bytes.Compare(n.inodes[mid].key, key) == -1 {
+			low = mid + 1
+		} else if bytes.Compare(n.inodes[mid].key, key) == 1 {
+			high = mid - 1
+		} else {
 			exact = true
+			index = mid
 		}
-		return ret != -1
-	})
-	if !exact && index > 0 {
-		index--
 	}
+
+	if bytes.Compare(n.inodes[low].key, key) == 0 {
+		exact = true
+		index = low
+	} else if bytes.Compare(n.inodes[high].key, key) == 0 {
+		exact = true
+		index = high
+	} else {
+		exact = false
+	}
+
+	if !exact {
+		// Return the highest index in the array of internal nodes of a data node
+		index = len(n.inodes)
+		for {
+			ret := bytes.Compare(n.inodes[index].key, key)
+			if ret == 0 {
+				exact = true
+			}
+			if ret != -1 {
+				break
+			}
+			index--
+		}
+
+		// If the exact key has not been found, then it should belongs to the data node referenced by the internal node at index (index - 1)
+		if !exact && index > 0 {
+			index--
+		}
+	}
+
+	// Update the index of the node to be searched
 	c.stack[len(c.stack)-1].index = index
 
 	// Recursively search to the next page.
@@ -292,22 +338,66 @@ func (c *Cursor) searchNode(key []byte, n *node) {
 }
 
 func (c *Cursor) searchPage(key []byte, p *page) {
-	// Binary search for the correct range.
+	// Search for the correct range.
 	inodes := p.branchPageElements()
-
+	var index int
 	var exact bool
-	index := sort.Search(int(p.count), func(i int) bool {
-		// TODO(benbjohnson): Optimize this range search. It's a bit hacky right now.
-		// sort.Search() finds the lowest index where f() != -1 but we need the highest index.
-		ret := bytes.Compare(inodes[i].key(), key)
-		if ret == 0 {
+
+	// Interpolation search
+	var mid int
+	var low int
+	low = 0
+	var high int
+	high = int(p.count)
+
+	// bytes.Compare(a, b) -> 1: a > b, -1: a < b, 0: a == b
+	for (bytes.Compare(inodes[low].key(), key) == -1) && (bytes.Compare(inodes[high].key(), key) == 1) {
+		key_int := int(binary.BigEndian.Uint64(key))
+		low_int := int(binary.BigEndian.Uint64(inodes[low].key()))
+		high_int := int(binary.BigEndian.Uint64(inodes[high].key()))
+		mid = low + ((key_int-low_int)*(high-low))/(high_int-low_int)
+
+		if bytes.Compare(inodes[mid].key(), key) == -1 {
+			low = mid + 1
+		} else if bytes.Compare(inodes[mid].key(), key) == 1 {
+			high = mid - 1
+		} else {
 			exact = true
+			index = mid
 		}
-		return ret != -1
-	})
-	if !exact && index > 0 {
-		index--
 	}
+
+	if bytes.Compare(inodes[low].key(), key) == 0 {
+		exact = true
+		index = low
+	} else if bytes.Compare(inodes[high].key(), key) == 0 {
+		exact = true
+		index = high
+	} else {
+		exact = false
+	}
+
+	if !exact {
+		// Return the highest index in the array of internal nodes of a data page with sequential search
+		index = int(p.count)
+		for {
+			ret := bytes.Compare(inodes[index].key(), key)
+			if ret == 0 {
+				exact = true
+			}
+			if ret != -1 {
+				break
+			}
+			index--
+		}
+
+		// If the exact key has not been found, then it should belongs to the data page referenced by the internal node at index (index - 1)
+		if !exact && index > 0 {
+			index--
+		}
+	}
+
+	// Update the index of the node to be searched. It is currently on top of the stack
 	c.stack[len(c.stack)-1].index = index
 
 	// Recursively search to the next page.
@@ -377,6 +467,7 @@ func (c *Cursor) node() *node {
 }
 
 // elemRef represents a reference to an element on a given page/node.
+// an element might be a data key, or a reference to a child page/node
 type elemRef struct {
 	page  *page
 	node  *node
